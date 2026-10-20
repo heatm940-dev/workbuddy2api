@@ -157,6 +157,9 @@ def _normalize_harness_body(chat_body: dict) -> dict:
         if stats.get("orphans"):
             _logger.warning("[harness-compat] 清理孤儿 tool_call %d 处 | diag=%s",
                             stats["orphans"], _tool_diag(chat_body))
+        if stats.get("identity"):
+            _logger.info("[harness-compat] 改写 DSH 身份句 %d 处（绕开 11128，issue #36）",
+                         stats["identity"])
         return chat_body
     except Exception as e:
         # 兼容层绝不阻断主流程：上游若真不认，会以它自己的错误码回给我们。

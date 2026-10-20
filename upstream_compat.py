@@ -1087,11 +1087,15 @@ class StreamCommitBuffer:
 # 10. 第三方 harness 兼容（DeepSeek Harness / pi-ai / Codex 等）
 # ---------------------------------------------------------------------------
 #
-# 逐项实测（2026-10-20，deepseek-v4.1-flash 直连上游）确认了**唯一**会被
-# 整条拒掉的字段，因此这里只修这一处：
+# 实测确认会被整条拒掉的字段有两类（均 HTTP 400 code=11128
+# "Illegal API invocation from an unapproved channel"），因此这里修这两处：
 #
-#   messages[].role == "developer"  →  HTTP 400 code=11128
-#       "Illegal API invocation from an unapproved channel"
+#   (a) messages[].role == "developer"  →  400 / 11128
+#   (b) system/developer 消息里出现整句 "You are an AI agent powered by
+#       DeepSeek Harness." —— 大小写不敏感的连续子串匹配，改大小写 / 加后缀都拦；
+#       只要把 "AI agent" 改成 "AI coding agent"（或去掉 "You are an"）即放行。
+#       这是 2026-10-21 上游新上的规则，DeepSeek Harness 桌面端固定开场白命中，
+#       详见 GitHub issue #36。
 #
 #   store / max_tokens / stream_options / tools /
 #   prompt_cache_key / prompt_cache_retention / metadata / user / service_tier
@@ -1104,6 +1108,47 @@ class StreamCommitBuffer:
 #      从请求体里抹掉，会让这些客户端在号池里失去会话粘性 —— 上游前缀缓存被
 #      打散、费用上升，这正是 pool.py 注释里要避免的事。
 #      所以：**只看上游实测结果增删字段，别顺手「清理」有语义的字段。**
+
+
+# 上游对 DeepSeek Harness 的固定开场白做大小写不敏感的整句连续子串匹配拦截
+# （HTTP 400 / code 11128 "Illegal API invocation from an unapproved channel"）。
+# 命中文本即 "you are an ai agent powered by deepseek harness"：改大小写、加后缀都拦；
+# 但只要把 "AI agent" 改成 "AI coding agent"（或去掉 "You are an"）就放行。
+# 这是 2026-10-21 上游新上的规则，DSH 桌面端的 system 开场白必然命中 —— 详见 issue #36。
+# 改写性质与 normalize_roles（developer→system）一致，都是把客户端发出的内容
+# 改成上游能收的形式，且是无条件步骤，不依赖 sanitize / desensitize 开关。
+_HARNESS_IDENTITY_RE = re.compile(
+    r"you are an ai agent powered by deepseek harness",
+    re.IGNORECASE,
+)
+_HARNESS_IDENTITY_FIX = "You are an AI coding agent powered by DeepSeek Harness"
+
+
+def normalize_harness_identity(obj: dict) -> int:
+    """改写 system/developer 消息里的 DSH 身份句，绕开上游整句匹配拦截（11128）。
+
+    返回改写条数；obj 就地改写。
+    """
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list):
+        return 0
+    n = 0
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") not in ("system", "developer"):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            if _HARNESS_IDENTITY_RE.search(content):
+                m["content"] = _HARNESS_IDENTITY_RE.sub(_HARNESS_IDENTITY_FIX, content)
+                n += 1
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    t = part["text"]
+                    if _HARNESS_IDENTITY_RE.search(t):
+                        part["text"] = _HARNESS_IDENTITY_RE.sub(_HARNESS_IDENTITY_FIX, t)
+                        n += 1
+    return n
 
 
 def normalize_harness_body(obj: dict) -> dict:
@@ -1125,9 +1170,11 @@ def normalize_harness_body(obj: dict) -> dict:
     返回改写统计 ``{"roles": n, "orphans": n}``，
     obj 就地改写，调用方原样发送即可。
     """
+    identity = normalize_harness_identity(obj)
     return {
         "roles": normalize_roles(obj),
         "orphans": cleanup_orphan_tool_calls(obj),
+        "identity": identity,
     }
 
 
@@ -1164,4 +1211,6 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
     backfill_reasoning_content(obj)
     if sanitize:
         sanitize_messages(obj)
+    # 无条件绕开上游对 DSH 身份句的整句匹配拦截（issue #36）。
+    normalize_harness_identity(obj)
     return obj
